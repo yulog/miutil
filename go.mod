@@ -5,4 +5,5 @@ go 1.22.0
 require (
 	github.com/goccy/go-json v0.10.3
 	github.com/google/uuid v1.6.0
+	gitlab.com/osaki-lab/iowrapper v0.0.0-20201210013351-bab12bc19f54
 )
