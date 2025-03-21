@@ -33,6 +33,13 @@ func (f *FS) getFile(name string) (*file, error) {
 		return nil, err
 	}
 	fmt.Println(out)
+	if len(out) == 0 {
+		return nil, &fs.PathError{
+			Op:   "open",
+			Path: name,
+			Err:  fs.ErrNotExist,
+		}
+	}
 	resp, err := http.Get(out[0].URL)
 	if err != nil {
 		return nil, err
