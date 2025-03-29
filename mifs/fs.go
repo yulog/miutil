@@ -30,7 +30,6 @@ var (
 )
 
 type FS struct {
-	// path   string
 	client *miutil.Client
 
 	cache *bigcache.BigCache
@@ -196,7 +195,6 @@ func (f *FS) getDir(fi fileInfo) (*dir, error) {
 		}
 	}
 
-	// d = dir{F: fi, path: fi.name, modTime: fi.modTime, Files: out, Folders: out2}
 	d = dir{F: fi, modTime: fi.modTime, Files: out, Folders: out2}
 
 	buf := bytes.NewBuffer(nil)
@@ -263,7 +261,6 @@ func (f *FS) Open(name string) (fs.File, error) {
 
 	fmt.Println("Open:", name)
 
-	// name = path.Join(f.path, name)
 	// http.FileServerFSで/がindex.htmlにリダイレクトされるため
 	bol, de := f.dirExists(name)
 	fmt.Println("dir ?:", bol, de.Fmode)
@@ -356,8 +353,7 @@ func (f *fileInfo) Info() (fs.FileInfo, error) {
 }
 
 type dir struct {
-	F fileInfo // use gob
-	// path    string
+	F       fileInfo // use gob
 	modTime time.Time
 	Files   []miutil.File   // use gob
 	Folders []miutil.Folder // use gob
