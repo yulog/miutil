@@ -1,34 +1,108 @@
 package mifs
 
 import (
+	"bytes"
+	"context"
+	"encoding/gob"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"io/fs"
 	"net/http"
+	"path"
+	"slices"
+	"strings"
 	"time"
 
+	"github.com/allegro/bigcache/v3"
 	"github.com/yulog/miutil"
 	"gitlab.com/osaki-lab/iowrapper"
+	"golang.org/x/sync/singleflight"
+)
+
+var (
+	_ fs.FS          = (*FS)(nil)
+	_ fs.File        = (*file)(nil)
+	_ io.Seeker      = (*file)(nil)
+	_ fs.FileInfo    = (*fileInfo)(nil)
+	_ fs.DirEntry    = (*fileInfo)(nil)
+	_ fs.ReadDirFile = (*dir)(nil)
 )
 
 type FS struct {
+	// path   string
 	client *miutil.Client
+
+	cache *bigcache.BigCache
 }
 
 func New(c *miutil.Client) (*FS, error) {
-	return &FS{client: c}, nil
+	config := bigcache.DefaultConfig(10 * time.Second)
+	config.HardMaxCacheSize = 10 // MB
+	cache, err := bigcache.New(context.TODO(), config)
+	if err != nil {
+		return nil, err
+	}
+	return &FS{client: c, cache: cache}, nil
+}
+
+func (f *FS) doWithCache(path string, r *miutil.Request, out any) error {
+	hash := fnv.New64a()
+	hash.Write([]byte(path))
+	hash.Write([]byte(r.URL))
+	var b io.Reader = r.Body
+	r.Body = io.TeeReader(b, hash)
+	sum := hash.Sum64()
+	if e, err := f.cache.Get(fmt.Sprintf("%x", sum)); err == nil {
+		fmt.Println("Cache Hit:", path, sum)
+		err := gob.NewDecoder(bytes.NewBuffer(e)).Decode(out)
+		if err != nil {
+			return err
+		}
+	} else {
+		fmt.Println("Cache Not Hit:", path)
+		err := r.Do(out)
+		if err != nil {
+			return err
+		}
+		buf := bytes.NewBuffer(nil)
+		err = gob.NewEncoder(buf).Encode(out)
+		if err != nil {
+			return err
+		}
+		f.cache.Set(fmt.Sprintf("%x", sum), buf.Bytes())
+	}
+	return nil
 }
 
 func (f *FS) getFile(name string) (*file, error) {
+	dir, name := path.Split(name)
+	id := ""
+	if dir != "" {
+		ok, folder := f.findDir(dir)
+		fmt.Println(dir, ok, folder)
+		if !ok {
+			return nil, &fs.PathError{
+				Op:   "open",
+				Path: name,
+				Err:  fs.ErrNotExist,
+			}
+		}
+		id = folder.ID
+	}
+
 	body := map[string]any{
 		"name": name,
+	}
+	if id != "" {
+		body["folderId"] = id
 	}
 	r, err := f.client.NewPostRequest("api/drive/files/find", body)
 	if err != nil {
 		return nil, err
 	}
 	var out []miutil.File
-	err = r.Do(&out)
+	err = f.doWithCache(name, r, &out)
 	if err != nil {
 		return nil, err
 	}
@@ -57,22 +131,125 @@ func (f *FS) getFile(name string) (*file, error) {
 		fileInfo: fileInfo{
 			name:    name,
 			size:    int64(out[0].Size), //resp.ContentLength
-			mode:    0,
+			Fmode:   0,
 			modTime: out[0].CreatedAt}}, nil
 }
 
-func (f *FS) getDir() (*dir, error) {
-	body := map[string]any{}
-	r, err := f.client.NewPostRequest("api/drive/files", body)
-	if err != nil {
-		return nil, err
-	}
+var dirGroup singleflight.Group
+
+func (f *FS) getDir(fi fileInfo) (*dir, error) {
+	var d dir
 	var out []miutil.File
-	err = r.Do(&out)
+	var out2 []miutil.Folder
+	if e, err := f.cache.Get(fi.name); err == nil {
+		fmt.Println("Hit:", fi.name)
+		err := gob.NewDecoder(bytes.NewBuffer(e)).Decode(&d)
+		if err != nil {
+			return nil, err
+		}
+		return &d, nil
+	}
+
+	var r *miutil.Request
+	var err error
+	if fi.name == "" || fi.name == "." {
+		fmt.Println("Call:", fi.name)
+		r, err := f.client.NewPostRequest("api/drive/files", map[string]any{})
+		if err != nil {
+			return nil, err
+		}
+		err = f.doWithCache(fi.name, r, &out)
+		if err != nil {
+			return nil, err
+		}
+
+		r, err = f.client.NewPostRequest("api/drive/folders", map[string]any{})
+		if err != nil {
+			return nil, err
+		}
+		err = f.doWithCache(fi.name, r, &out2)
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		ok, dir := f.findDir(fi.name)
+		if !ok {
+			return nil, err
+		}
+
+		r, err = f.client.NewPostRequest("api/drive/files", map[string]any{"folderId": dir.ID})
+		if err != nil {
+			return nil, err
+		}
+		err = f.doWithCache(fi.name, r, &out)
+		if err != nil {
+			return nil, err
+		}
+
+		r, err = f.client.NewPostRequest("api/drive/folders", map[string]any{"folderId": dir.ID})
+		if err != nil {
+			return nil, err
+		}
+		err = f.doWithCache(fi.name, r, &out2)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	// d = dir{F: fi, path: fi.name, modTime: fi.modTime, Files: out, Folders: out2}
+	d = dir{F: fi, modTime: fi.modTime, Files: out, Folders: out2}
+
+	buf := bytes.NewBuffer(nil)
+	err = gob.NewEncoder(buf).Encode(&d)
 	if err != nil {
 		return nil, err
 	}
-	return &dir{files: out}, nil
+	f.cache.Set(fi.name, buf.Bytes())
+	fmt.Println("getDir dir:", d)
+
+	return &d, nil
+}
+
+func (f *FS) dirExists(name string) (bool, fileInfo) {
+	if name == "" || name == "." {
+		return true, fileInfo{name: name, Fmode: fs.ModeDir, modTime: time.Time{}}
+	}
+	ok, dir := f.findDir(name)
+	if !ok {
+		return false, fileInfo{}
+	}
+
+	return ok, fileInfo{name: name, Fmode: fs.ModeDir, modTime: dir.CreatedAt}
+}
+
+func (f *FS) findDir(path string) (bool, miutil.Folder) {
+	var out []miutil.Folder
+	var pid string
+	var r *miutil.Request
+	var err error
+	ps := strings.Split(strings.Trim(path, "/"), "/")
+	for i, v := range ps {
+		if i < 1 {
+			r, err = f.client.NewPostRequest("api/drive/folders/find", map[string]any{"name": v})
+		} else {
+			r, err = f.client.NewPostRequest("api/drive/folders/find", map[string]any{"name": v, "parentId": pid})
+		}
+		if err != nil {
+			return false, miutil.Folder{}
+		}
+		err = f.doWithCache(v, r, &out)
+		if err != nil {
+			return false, miutil.Folder{}
+		}
+		ok := slices.ContainsFunc(out, func(e miutil.Folder) bool {
+			return e.Name == v
+		})
+		if !ok {
+			return false, miutil.Folder{}
+		}
+		pid = out[0].ID
+	}
+	return true, out[0]
 }
 
 func (f *FS) Open(name string) (fs.File, error) {
@@ -86,9 +263,21 @@ func (f *FS) Open(name string) (fs.File, error) {
 
 	fmt.Println("Open:", name)
 
+	// name = path.Join(f.path, name)
 	// http.FileServerFSで/がindex.htmlにリダイレクトされるため
-	if name == "" || name == "." || name == "index.html" {
-		return f.getDir()
+	bol, de := f.dirExists(name)
+	fmt.Println("dir ?:", bol, de.Fmode)
+	if bol {
+		// TODO: singleflightの使い方が分かっていない
+		v, err, shared := dirGroup.Do(name, func() (any, error) {
+			return f.getDir(de)
+		})
+		if err != nil {
+			return nil, err
+		}
+		// fmt.Printf("result: %s, shared: %t\n", v, shared)
+		fmt.Printf("shared: %t\n", shared)
+		return v.(*dir), nil
 	}
 
 	return f.getFile(name)
@@ -102,7 +291,6 @@ type file struct {
 }
 
 func (f *file) Stat() (fs.FileInfo, error) {
-	fmt.Println(f.fileInfo)
 	return &f.fileInfo, nil
 }
 
@@ -129,7 +317,7 @@ func (f *file) ReadDir(n int) ([]fs.DirEntry, error) {
 type fileInfo struct {
 	name    string
 	size    int64
-	mode    fs.FileMode
+	Fmode   fs.FileMode // use gob
 	modTime time.Time
 }
 
@@ -142,7 +330,7 @@ func (f *fileInfo) Size() int64 {
 }
 
 func (f *fileInfo) Mode() fs.FileMode {
-	return f.mode
+	return f.Fmode
 }
 
 func (f *fileInfo) ModTime() time.Time {
@@ -150,29 +338,33 @@ func (f *fileInfo) ModTime() time.Time {
 }
 
 func (f *fileInfo) IsDir() bool {
-	return f.mode.IsDir()
+	return f.Fmode.IsDir()
 }
 
 func (f *fileInfo) Sys() any {
 	return nil
 }
 
+// Type for fs.DirEntry
 func (f *fileInfo) Type() fs.FileMode {
 	return f.Mode().Type()
 }
 
+// Info for fs.DirEntry
 func (f *fileInfo) Info() (fs.FileInfo, error) {
 	return f, nil
 }
 
 type dir struct {
-	path    string
+	F fileInfo // use gob
+	// path    string
 	modTime time.Time
-	files   []miutil.File
+	Files   []miutil.File   // use gob
+	Folders []miutil.Folder // use gob
 }
 
 func (d *dir) Stat() (fs.FileInfo, error) {
-	return d, nil
+	return &d.F, nil
 }
 
 func (d *dir) Read(buf []byte) (int, error) {
@@ -209,17 +401,31 @@ func (d *dir) Sys() any {
 
 func (d *dir) ReadDir(n int) ([]fs.DirEntry, error) {
 	var l []fs.DirEntry
-	for i := range d.files {
+	for i := range d.Files {
 		if n == len(l) {
 			break
 		}
 
 		l = append(l, &fileInfo{
-			name:    d.files[i].Name,
-			size:    int64(d.files[i].Size),
-			modTime: d.files[i].CreatedAt,
+			name:    d.Files[i].Name,
+			size:    int64(d.Files[i].Size),
+			modTime: d.Files[i].CreatedAt,
 		})
 	}
+	d.Files = nil
+	for i := range d.Folders {
+		if n == len(l) {
+			break
+		}
+
+		l = append(l, &fileInfo{
+			name:    d.Folders[i].Name,
+			size:    0,
+			Fmode:   fs.ModeDir,
+			modTime: d.Folders[i].CreatedAt,
+		})
+	}
+	d.Folders = nil
 
 	if len(l) == 0 && n > 0 {
 		return []fs.DirEntry{}, io.EOF

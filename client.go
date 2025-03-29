@@ -13,8 +13,8 @@ type Client struct {
 }
 
 type Request struct {
-	url  string
-	body io.Reader
+	URL  string
+	Body io.Reader
 }
 
 func NewClient(host, credential string) *Client {
@@ -33,9 +33,9 @@ func (c *Client) NewPostRequest(u string, body map[string]any) (*Request, error)
 		return &Request{}, err
 	}
 
-	return &Request{url: u, body: buf}, nil
+	return &Request{URL: u, Body: buf}, nil
 }
 
 func (r *Request) Do(out any) error {
-	return Post3(r.url, r.body, out)
+	return Post3(r.URL, r.Body, out)
 }
