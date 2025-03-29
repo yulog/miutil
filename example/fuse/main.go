@@ -6,7 +6,7 @@ import (
 	"io/fs"
 	"os"
 
-	"github.com/binzume/dkango"
+	"github.com/binzume/fsmount"
 	"github.com/yulog/miutil"
 	"github.com/yulog/miutil/mifs"
 )
@@ -34,7 +34,7 @@ func main() {
 	for _, path := range paths {
 		fmt.Println(path)
 	}
-	mount, err := dkango.MountFS("M:", mfs, nil)
+	mount, err := fsmount.MountFS("M:", mfs, nil)
 	if err != nil {
 		panic(err)
 	}
