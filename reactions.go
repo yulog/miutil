@@ -117,3 +117,10 @@ type Reply struct {
 	RenoteID           any       `json:"renoteId"`
 	Mentions           []string  `json:"mentions"`
 }
+
+type Folder struct {
+	ID        string    `json:"id"`
+	CreatedAt time.Time `json:"createdAt"`
+	Name      string    `json:"name"`
+	ParentID  any       `json:"parentId"`
+}
