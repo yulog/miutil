@@ -18,6 +18,7 @@ require (
 require (
 	github.com/allegro/bigcache/v3 v3.1.0
 	github.com/binzume/fsmount v0.1.4
+	github.com/patrickmn/go-cache v2.1.0+incompatible
 	golang.org/x/sync v0.12.0
 	golang.org/x/sys v0.0.0-20220818161305-2296e01440c6 // indirect
 )

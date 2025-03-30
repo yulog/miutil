@@ -1,6 +1,7 @@
 package mifs
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/gob"
@@ -9,12 +10,14 @@ import (
 	"io"
 	"io/fs"
 	"net/http"
+	"net/http/httputil"
 	"path"
 	"slices"
 	"strings"
 	"time"
 
 	"github.com/allegro/bigcache/v3"
+	"github.com/patrickmn/go-cache"
 	"github.com/yulog/miutil"
 	"gitlab.com/osaki-lab/iowrapper"
 	"golang.org/x/sync/singleflight"
@@ -32,17 +35,19 @@ var (
 type FS struct {
 	client *miutil.Client
 
-	cache *bigcache.BigCache
+	cache     *bigcache.BigCache
+	fileCache *cache.Cache
 }
 
 func New(c *miutil.Client) (*FS, error) {
 	config := bigcache.DefaultConfig(10 * time.Second)
 	config.HardMaxCacheSize = 10 // MB
-	cache, err := bigcache.New(context.TODO(), config)
+	bcache, err := bigcache.New(context.TODO(), config)
 	if err != nil {
 		return nil, err
 	}
-	return &FS{client: c, cache: cache}, nil
+	fcache := cache.New(5*time.Minute, 10*time.Minute)
+	return &FS{client: c, cache: bcache, fileCache: fcache}, nil
 }
 
 func (f *FS) doWithCache(path string, r *miutil.Request, out any) error {
@@ -113,9 +118,29 @@ func (f *FS) getFile(name string) (*file, error) {
 			Err:  fs.ErrNotExist,
 		}
 	}
-	resp, err := http.Get(out[0].URL)
-	if err != nil {
-		return nil, err
+	var resp *http.Response
+	req, _ := http.NewRequest(http.MethodGet, out[0].URL, nil)
+	v, found := f.fileCache.Get(out[0].URL)
+	if found {
+		fmt.Println("FileCache Hit:", out[0].URL)
+		resp, err = http.ReadResponse(bufio.NewReader(bytes.NewReader(v.([]byte))), req)
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		fmt.Println("FileCache Not Hit:", out[0].URL)
+		resp, err = http.DefaultClient.Do(req)
+		if err != nil {
+			fmt.Println("do", err)
+			return nil, err
+		}
+		dump, err := httputil.DumpResponse(resp, true)
+		if err != nil {
+			fmt.Println("dump", err)
+			return nil, err
+		}
+		f.fileCache.Set(out[0].URL, dump, cache.DefaultExpiration)
+		fmt.Println("set", len(dump))
 	}
 
 	// https://github.com/golang/go/issues/27617#issuecomment-1898641407
