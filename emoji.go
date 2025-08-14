@@ -3,7 +3,9 @@
 // https://mholt.github.io/json-to-go/ で生成後、修正
 package miutil
 
-type Emojis []Emoji
+type Emojis struct {
+	Emojis []Emoji `json:"emojis"`
+}
 
 type Emoji struct {
 	ID                                         string   `json:"id"`
